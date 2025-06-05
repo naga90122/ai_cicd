@@ -1,24 +1,70 @@
-# agents.py - Multi-Agent System Implementation
+%%writefile agents.py
+# agents.py - Kaggle-Compatible Multi-Agent System
 import os
 import json
 import time
-import base64
 import requests
-import subprocess
 import chromadb
 import fitz  # PyMuPDF
-from github import Github, GithubException
+import numpy as np
 from duckduckgo_search import DDGS
 from chromadb.utils import embedding_functions
 from typing import Dict, List, Optional, Tuple
 
-# Configuration
+# Configuration for Kaggle
 class Config:
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
     GITHUB_REPO = "naga90122/ai_cicd"
-    VECTORDB_PATH = "./vector_db"
+    VECTORDB_PATH = "/kaggle/working/vector_db"
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-    LLM_API_URL = "http://localhost:5000/v1/completions"  # Local LLM endpoint
+    LLM_API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-v0.1"
+
+# GitHub API Implementation (since PyGithub isn't available)
+class GitHubAPI:
+    BASE_URL = "https://api.github.com"
+    
+    def __init__(self, token):
+        self.token = token
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+    
+    def get_repo(self, repo_name):
+        url = f"{self.BASE_URL}/repos/{repo_name}"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            return self.create_repo(repo_name.split("/")[1])
+        else:
+            raise Exception(f"GitHub API Error: {response.status_code} - {response.text}")
+    
+    def create_repo(self, repo_name, private=True):
+        url = f"{self.BASE_URL}/user/repos"
+        data = {
+            "name": repo_name,
+            "private": private,
+            "auto_init": True
+        }
+        response = requests.post(url, json=data, headers=self.headers)
+        if response.status_code == 201:
+            return response.json()
+        else:
+            raise Exception(f"Create repo failed: {response.status_code} - {response.text}")
+    
+    def create_file(self, repo_name, path, content, message, branch="main"):
+        url = f"{self.BASE_URL}/repos/{repo_name}/contents/{path}"
+        data = {
+            "message": message,
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": branch
+        }
+        response = requests.put(url, json=data, headers=self.headers)
+        if response.status_code in [200, 201]:
+            return response.json()
+        else:
+            raise Exception(f"Create file failed: {response.status_code} - {response.text}")
 
 # Base Agent Class
 class Agent:
@@ -35,97 +81,50 @@ class Agent:
         self.log_history = []
     
     def query_llm(self, prompt: str, max_tokens=512) -> str:
-        """Query local LLM API"""
+        """Query Hugging Face LLM API"""
         try:
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Authorization": f"Bearer {os.environ['HF_TOKEN']}",
+                "Content-Type": "application/json"
+            }
             data = {
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "temperature": 0.7
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": max_tokens,
+                    "temperature": 0.7,
+                    "return_full_text": False
+                }
             }
             response = requests.post(Config.LLM_API_URL, json=data, headers=headers)
-            return response.json()["choices"][0]["text"].strip()
+            return response.json()[0]['generated_text'].strip()
         except Exception as e:
             self.log(f"LLM Error: {str(e)}")
             return ""
 
-# GitHub Agent
+# GitHub Agent using direct API calls
 class GitHubAgent(Agent):
     def __init__(self):
         super().__init__("GitHubAgent")
         if not Config.GITHUB_TOKEN:
-            raise ValueError("Missing GITHUB_TOKEN in environment variables")
+            raise ValueError("GITHUB_TOKEN environment variable not set")
         
-        self.auth = Github(Config.GITHUB_TOKEN)
-        try:
-            self.repo = self.auth.get_repo(Config.GITHUB_REPO)
-        except GithubException:
-            self.repo = self.create_repo(Config.GITHUB_REPO)
-    
-    def create_repo(self, repo_name: str) -> str:
-        """Create new repository if not exists"""
-        user = self.auth.get_user()
-        repo = user.create_repo(repo_name, auto_init=True)
-        self.log(f"Created new repository: {repo_name}")
-        return repo
+        self.api = GitHubAPI(Config.GITHUB_TOKEN)
+        self.repo = self.api.get_repo(Config.GITHUB_REPO)
     
     def commit_files(self, files: Dict[str, str], commit_message: str):
         """Commit multiple files to repository"""
         try:
-            # Get current commit SHA
-            branch = self.repo.get_branch("main")
-            base_tree = self.repo.get_git_tree(sha=branch.commit.sha)
-            
-            # Create blobs
-            blobs = []
             for path, content in files.items():
-                if isinstance(content, str):
-                    content = content.encode("utf-8")
-                blob = self.repo.create_git_blob(content.decode("utf-8") if isinstance(content, bytes) else content, "utf-8")
-                blobs.append({
-                    "path": path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob.sha
-                })
-            
-            # Create new tree
-            new_tree = self.repo.create_git_tree(blobs, base_tree)
-            new_commit = self.repo.create_git_commit(
-                message=commit_message,
-                tree=new_tree,
-                parents=[branch.commit.sha]
-            )
-            
-            # Update reference
-            self.repo.get_git_ref("heads/main").edit(new_commit.sha)
+                self.api.create_file(
+                    repo_name=Config.GITHUB_REPO,
+                    path=path,
+                    content=content,
+                    message=commit_message
+                )
             self.log(f"Committed {len(files)} files: {commit_message}")
             return True
-        except GithubException as e:
+        except Exception as e:
             self.log(f"Commit failed: {str(e)}")
-            return False
-    
-    def push_local_repo(self, local_path: str):
-        """Push local repository changes"""
-        try:
-            # Configure remote URL with token
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", 
-                 f"https://{Config.GITHUB_TOKEN}@github.com/{Config.GITHUB_REPO}.git"],
-                cwd=local_path,
-                check=True
-            )
-            
-            # Push changes
-            subprocess.run(
-                ["git", "push", "origin", "main"],
-                cwd=local_path,
-                check=True
-            )
-            self.log("Pushed local repository to GitHub")
-            return True
-        except subprocess.CalledProcessError as e:
-            self.log(f"Git push failed: {str(e)}")
             return False
 
 # VectorDB Agent
@@ -223,7 +222,7 @@ class ArchitectAgent(Agent):
         response = self.query_llm(prompt)
         try:
             return json.loads(response)
-        except json.JSONDecodeError:
+        except:
             self.log("Failed to parse design as JSON")
             return {
                 "overview": "Design generation failed",
@@ -237,9 +236,9 @@ class DeveloperAgent(Agent):
     def __init__(self):
         super().__init__("DeveloperAgent")
     
-    def write_code(self, specification: str, language: str = "python") -> Dict[str, str]:
+    def write_code(self, specification: str) -> Dict[str, str]:
         """Generate code based on specification"""
-        prompt = f"""You are a senior {language} developer. Write code based on this specification:
+        prompt = f"""You are a senior developer. Write code based on this specification:
         
         {specification}
         
@@ -255,7 +254,7 @@ class DeveloperAgent(Agent):
         response = self.query_llm(prompt)
         try:
             return json.loads(response)
-        except json.JSONDecodeError:
+        except:
             self.log("Failed to parse code as JSON")
             return {"files": {}, "dependencies": []}
 
@@ -288,7 +287,7 @@ class QAAgent(Agent):
         response = self.query_llm(prompt)
         try:
             return json.loads(response)
-        except json.JSONDecodeError:
+        except:
             self.log("Failed to parse tests as JSON")
             return {"test_cases": [], "automated_tests": {}}
 
@@ -369,7 +368,7 @@ class MasterAgent:
         all_files.update(code_output["files"])
         all_files.update(tests["automated_tests"])
         all_files["Dockerfile"] = dockerfile
-        all_files[".github/workflows/cicd.yaml"] = ci_cd
+        all_files[".github/workflows/cicd.yml"] = ci_cd
         all_files["DESIGN.md"] = json.dumps(design, indent=2)
         all_files["RESEARCH.md"] = "\n\n".join(
             [f"## {r['title']}\nURL: {r['url']}\n{r['snippet']}" for r in research]
